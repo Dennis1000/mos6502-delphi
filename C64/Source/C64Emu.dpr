@@ -1,4 +1,4 @@
-program C6Emu;
+program C64Emu;
 
 uses
   Vcl.Forms,
