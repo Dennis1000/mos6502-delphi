@@ -15,7 +15,6 @@ const
 
 type
   TC64 = class;
-  PC64 = ^TC64;
 
   TC64Thread = class(TThread)
   private
