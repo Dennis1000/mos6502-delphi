@@ -25,3 +25,7 @@ The C64 Emulator uses a symbolic keyboard translation thus any keyboard layout s
 
 This C64 emulator is just a a very basic 6502/6510 emulation example and is not feature complete. Please take a look at [VICE - Versatile Commodore Emulator](http://vice-emu.sourceforge.net/) instead.
 
+# VIC-20 emulator
+
+Based on the C64 emulator, a VIC-20 emulator is now included. You need to download the BASIC ROM [basic.901486-01.bin](http://www.commodore.ca/manuals/funet/cbm/firmware/computers/vic20/basic.901486-01.bin) and the Kernal ROM [kernal.901486-07.bin](http://www.commodore.ca/manuals/funet/cbm/firmware/computers/vic20/kernal.901486-07.bin) and put both files inside the ROMs folder. Changes compared to the C64 source are Addr and Keyboard matrix.
+
