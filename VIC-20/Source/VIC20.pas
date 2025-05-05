@@ -14,6 +14,14 @@ uses
 {$ENDIF}
   MOS6502;
 
+// USE_THREADEDTIMERSIMULATION compiler switch
+// If activated the program uses the 6502 CPU Cycles as the time base and
+//  inserts every 18470 cycles (=16.66359 ms = (nearly) 1/60s  the timer interrupt.
+//  It also support other IRQ timing, since the registers of the VIA2 $9124, $9125 are used.
+// If deactivated, a System-Timer is used and triggers
+//  every 17ms (almost 1/59s) the timer interrupt.
+{$DEFINE USE_THREADEDTIMERSIMULATION}
+
 const
   WM_SCREEN_WRITE = WM_USER + 0;
 
@@ -97,13 +105,28 @@ const
                     #00+#00+'='+#00+'?'+']'+#00+#00+  // $70..$77
                     #00+#00+#00+#00+#00+#00+#13+#08;  // $78..$7f  127
 
+  // Some consts for the timer
+  // PAL
+  SYS_FREQ_PAL = 4.433618e6 / 4.0; // PAL Frequency 4.433618 MHz => 1.108405 MHz => Clk Period 0.902197e-6 s
+  // VIA Timer Register Addr $9125, $9124, see memory $FE3E... LDA #$26 and $FE43 LDA #$48 => $4826 = 18470 => 16,6635 ms => 1/60.01s
+  // NTSC
+  SYS_FREQ_NTSC = 14.318180e6 / 14.0; // NTSC Frequency 14.318180 MHz => 1.022727 MHz => Clk Period 0.9777779e-6 s
+  // VIA Timer register Addr $9125, $9124, see memory $FE3E... LDA #$89 and $FE43 LDA #$42 => $4289 = 17033 => 16.6545 ms => 1/60.04s
+
 type
   TVC20 = class;
 
   TVC20Thread = class(TThread)
   private
     VC20: TVC20;
+    FAvgIRQPeriod : Single;
+    FAvgSysTime6502EmulationRatio : Single;
   protected
+    // Average time in Microseconds between two timer interrups
+    property AvgIRQPeriod : Single read FAvgIRQPeriod;
+    // Average ratio between the consumed time by the system and the emulation.
+    // E.g. a value of 0.3 means that the system uses 30% of the time to emulate the VIC and 70% to wait.
+    property AvgSysTime6502EmulationRatio : Single read FAvgSysTime6502EmulationRatio;
   public
     procedure Execute; override;
     constructor Create(VC20Instance: TVC20);
@@ -118,14 +141,23 @@ type
   end;
   TV20MemRangeArr = array of TV20MemRange;
 
+  TVC20SystemFreqKind = (fkNTSC, fkPAL);
+
   { TVC20 }
 
   TVC20 = class(TMOS6502)
   private
     Thread: TVC20Thread;
+    {$IFDEF USE_THREADEDTIMERSIMULATION}
+    IRQCycleLowByte : Byte; // The low byte written to the VIA
+    IRQCycleCnt : Word; // The actual value used by the VIA
+    {$ELSE}
     TimerHandle: Integer;
+    {$ENDIF}
     LastKey: Char;
     FMemoryMap : TV20MemRangeArr;
+    FCPU6502Freq : Double;
+    FCPU6502CyclePeriodUs : Double;
     procedure OnBusWrite(Adr: Word; Value: Byte);
     function OnBusRead(Adr: Word): Byte;
     function KeyRead: Byte;
@@ -145,9 +177,10 @@ type
     property MemoryMapItemCount : Integer read GetMemoryMapItemCount;
     property MemoryMapItems[Index : Integer] : TV20MemRange read GetMemoryMapItems;
     property MemoryMapKinds[Index : Integer] : TVC20MemKind read GetMemoryMapKinds write SetMemoryMapKinds;
-    constructor Create;
+    constructor Create(const ASysFreqKind : TVC20SystemFreqKind = fkNTSC);
     destructor Destroy; override;
     procedure LoadROM(Filename: String; Addr: Word);
+    procedure SetSysFreq(const ASysFreqKind : TVC20SystemFreqKind);
     procedure Add3KRAMExt;
     procedure Exec;
     procedure SetKey(Key: Char; Value: Byte);
@@ -157,15 +190,16 @@ implementation
 
 uses
 {$IFnDEF FPC}
-  Winapi.Windows, System.SysUtils, WinApi.MMSystem;
+  Winapi.Windows, System.SysUtils {$IFnDEF USE_THREADEDTIMERSIMULATION}, WinApi.MMSystem{$ENDIF};
 {$ELSE}
-  SysUtils, MMSystem;
+  SysUtils {$IFnDEF USE_THREADEDTIMERSIMULATION},MMSystem{$ENDIF};
 {$ENDIF}
 
 
-{ TVC20 }
 
-procedure TimerProcedure(TimerID, Msg: Uint; dwUser, dw1, dw2: DWORD); pascal;
+{ TVC20 }
+{$IFnDEF USE_THREADEDTIMERSIMULATION}
+procedure TimerProcedure(TimerID, Msg: Uint; dwUser, dw1, dw2: DWORD_PTR);pascal;
 var
   VC20: TVC20;
 begin
@@ -174,7 +208,7 @@ begin
   if VC20.Status and INTERRUPT_FLAG = 0 then // if IRQ allowed then set irq
     VC20.InterruptRequest := True;
 end;
-
+{$ENDIF}
 
 function TVC20.OnBusRead(Adr: Word): Byte;
 var
@@ -202,9 +236,17 @@ begin
         Memory[CIA1 + 1] := KeyRead;
       end;
 
-    CIA1 + 5: // Timer
-     if TimerHandle = 0 then
-       TimerHandle := TimeSetEvent(34, 2, @TimerProcedure, DWORD(Self), TIME_PERIODIC);
+    {$IFDEF USE_THREADEDTIMERSIMULATION}
+    CIA1 + 4: // Timer1 latch lowbyte
+      IRQCycleLowByte := Value;
+    {$ENDIF}
+    CIA1 + 5: // Timer1 latch highbyte
+      {$IFDEF USE_THREADEDTIMERSIMULATION}
+      IRQCycleCnt := (Value shl 8) or IRQCycleLowByte;
+      {$ELSE}
+      if TimerHandle = 0 then
+        TimerHandle := TimeSetEvent(IRQ_CLK_MS_ROUND, 1, @TimerProcedure, DWORD_PTR(Self), TIME_PERIODIC);
+      {$ENDIF}
   end;
 
   if (memk = mkROM) or
@@ -218,10 +260,10 @@ begin
     PostMessage(WndHandle, WM_SCREEN_WRITE, Adr - $1E00, Value);  // $400
 end;
 
-constructor TVC20.Create;
+constructor TVC20.Create(const ASysFreqKind: TVC20SystemFreqKind);
 begin
   inherited Create(OnBusRead, OnBusWrite);
-
+  SetSysFreq(ASysFreqKind);
   // create 64kB memory table
   SetLength(Memory, 65536);
 
@@ -232,9 +274,13 @@ end;
 
 destructor TVC20.Destroy;
 begin
+  {$IFnDEF USE_THREADEDTIMERSIMULATION}
   if TimerHandle <> 0 then
-    Timekillevent(TimerHandle);
+     Timekillevent(TimerHandle);
+  {$ENDIF}
+
   Thread.Terminate;
+  Thread.Suspended := False;
   Thread.WaitFor;
   Thread.Free;
   SetLength(Memory,0);
@@ -406,6 +452,19 @@ begin
   end;
 end;
 
+procedure TVC20.SetSysFreq(const ASysFreqKind: TVC20SystemFreqKind);
+var
+  d : Double;
+begin
+  case ASysFreqKind of
+    fkPAL : FCPU6502Freq := SYS_FREQ_PAL; // // PAL Frequency 4.433 MHz / 4
+  else
+    // fkNTSC
+    FCPU6502Freq := SYS_FREQ_NTSC; // NTSC Frequency  14.318180 MHz / 14
+  end;
+  FCPU6502CyclePeriodUs := 1.0/FCPU6502Freq*1e6;
+end;
+
 procedure TVC20.Add3KRAMExt;
 var
   i : Integer;
@@ -445,7 +504,6 @@ begin
 end;
 
 { TVC20Thread }
-
 constructor TVC20Thread.Create(VC20Instance: TVC20);
 begin
   inherited Create(True);
@@ -453,16 +511,126 @@ begin
 end;
 
 procedure TVC20Thread.Execute;
-begin
-  while (not Terminated) do
+  function MicroSecondsFromTick(const ATick, AFreq : TLargeInteger) : Double;inline;
   begin
-    if VC20.InterruptRequest then
+    Result := (ATick * 1000000) / AFreq; // convert the Tick into microsecs
+  end;
+
+var
+  lastCycle, curCycle : Int64; // the 6502 CPU Cycle before and after execution
+  {$IFDEF USE_THREADEDTIMERSIMULATION}
+  lastIRQCycle : Int64;
+  {$ENDIF}
+  sysFreq : TLargeInteger; // the CPU frequency of the running system (assumed as static!)
+  // The Ticks from the system
+  lastSysTick, curSysTick: TLargeInteger;
+  runTimeSysInUs, runTime6502InUs, deltaRunTimeInUs : Double;
+  curIRQTick, lastIRQTick : TLargeInteger;
+  d : Double;
+begin
+  try
+    Priority := tpTimeCritical;
+    FAvgSysTime6502EmulationRatio := 0.3; // Assuming that the system uses 30% to emulate and 70% to wait
+    FAvgIRQPeriod := 16667.0;
+    curSysTick := 0;
+    sysFreq := 0;
+    lastSysTick := 0;
+    QueryPerformanceFrequency(sysFreq);
+    QueryPerformanceCounter(lastSysTick);
+    lastCycle := VC20.Cycles;
+    {$IFDEF USE_THREADEDTIMERSIMULATION}lastIRQCycle := 0;{$ENDIF}
+
+    curIRQTick := 0;
+    lastIRQTick := 0;
+
+
+    while (not Terminated) do
     begin
-      VC20.InterruptRequest := False;
-      VC20.IRQ;
+      // If the IRQ-Flag is set
+      if VC20.InterruptRequest then
+      begin
+        // Measure the time between two IRQa
+        curIRQTick := curSysTick;
+        if lastIRQTick > 0 then
+        begin
+          d := MicroSecondsFromTick(curIRQTick-lastIRQTick,sysFreq);
+          FAvgIRQPeriod := (FAvgIRQPeriod*0.99)+(d*(1.0-0.99));
+        end;
+        lastIRQTick := curIRQTick;
+        // Reset the IRQ-Flag and proceed with the IRQ
+        VC20.InterruptRequest := False;
+        VC20.IRQ;
+      end;
+      VC20.Step; // Process one Command
+      curCycle := VC20.Cycles; // save current Cycle counter
+      Sleep(0); // Let other Tasks proceed
+      QueryPerformanceCounter(curSysTick); // get the tick after the execution an the sleep(0)
+
+      // Condiditional compiling, use internal stepper to simulate the VIA timer
+      // This will give a better overall performance of the IRQ.
+      // The IRQ is executed much closer to the real step as if fired from outside.
+      // It allows the 6502 program to change the VIA Timer
+      {$IFDEF USE_THREADEDTIMERSIMULATION}
+      if ((VC20.Memory[CIA1 + $B] and $40) <> 0) and  // Timer enabled
+         (VC20.IRQCycleCnt <> 0) then                 // Timer value set
+      begin
+        if (curCycle - lastIRQCycle) >= VC20.IRQCycleCnt then
+        begin
+          lastIRQCycle := curCycle;
+          if ((VC20.Status and INTERRUPT_FLAG) = 0) then // if IRQ allowed then set irq
+            VC20.InterruptRequest := True;
+        end;
+      end
+      else // Timer disabled
+      begin
+        lastIRQCycle := curCycle;
+      end;
+      {$ENDIF}
+
+      // Timing.
+      // We assume that the emulation is faster than the original VIC-20.
+      // (If not, we are lost anyway).
+      // There are two options. One is to burn CPU time by adding some microseconds
+      // after each step. This may double or more the CPU load.
+      // The second option, which is implemented here, is to execute a number of
+      // 6502-Cycles as fast as the emulation does until the emulation is
+      // 10ms behind the running system (PC clock) and than burn the time with
+      // System-sleep commands.
+
+      runTimeSysInUs := MicroSecondsFromTick(curSysTick-lastSysTick,sysFreq); // consumed time in microsecs of the system
+      runTime6502InUs := (curCycle - lastCycle) * VC20.FCPU6502CyclePeriodUs; // calculate the micro seconds in the 6502 CPU
+      deltaRunTimeInUs := runTime6502InUs-runTimeSysInUs; // calculate the delta between the expected runTime6502InUs and the real runTimeSysInUs
+      // If the system is running faster than the emulated 6502 than we have to wait.
+      // If the system is running slower, than everything is lost here. But if we
+      // stop in the debugger, this might be happen. You may than see a very fast blinking
+      // cursor, until the system catch up with 6502 time.
+      // The used timing is a bit experimental.
+      // It would be nicer and smoother to have a shorter "ahead of time" difference. E.g. 1ms
+      // But this would lead into the situation, that the actual wait call, which is
+      // fairly unprecise, will jitter the whole system.
+      // Thus we wait until we have 50ms ahead, but just to wait until we are somewhere between
+      // 10ms and 0ms ahead.
+      // The actual delay here will be than around 40ms.
+      if (deltaRunTimeInUs > 50*1000) then
+      begin // there is at least 50 Millisec to wait
+        // track the ratio between the time from the system and the emulation
+        FAvgSysTime6502EmulationRatio := (FAvgSysTime6502EmulationRatio * 0.99) + ((runTimeSysInUs / runTime6502InUs) * (1.0-0.99));
+        repeat
+          Sleep(5); // Sleep a while, let other threads do their job.
+          // Now, calculate the consumed time and increase the Systems Runtime
+          // until it reaches the 6502 Time
+          QueryPerformanceCounter(curSysTick); // get the tick after the execution an the sleep(0)
+          runTimeSysInUs := MicroSecondsFromTick(curSysTick-lastSysTick,sysFreq); // consumed time in microsecs
+          deltaRunTimeInUs := runTime6502InUs-runTimeSysInUs; // calculate the delta between the expected runTimeSysInUs and the real runTimeSysInUs
+        until (deltaRunTimeInUs <= (10*1000));
+        lastSysTick := curSysTick; // Set the lasttick to the current tick, as base point for the next measurement
+        lastCycle := Round(curCycle - (deltaRunTimeInUs * VC20.FCPU6502CyclePeriodUs)); // set the lastCycle to the assumed one
+      end;
     end;
-    VC20.Step;
-    Sleep(0);
+  finally
+    // Make sure that the threads execute method is never left in non terminated state
+    if not Terminated then
+      Terminate;
   end;
 end;
 

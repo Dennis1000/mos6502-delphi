@@ -70,7 +70,14 @@ begin
   fp := fp + '..\..\';
   {$ENDIF}
 
-  VC20.LoadROM(fp+'..\ROMs\kernal.901486-07.bin', $E000); // E000-FFFF
+  // NTSC Firmware
+  VC20.LoadROM(fp+'..\ROMs\kernal.901486-06.bin', $E000); // E000-FFFF
+  // PAL Firmware
+  // If the PAL firmware is used, you must tell the system the usage of PAL!!
+  // VC20.LoadROM(fp+'..\ROMs\kernal.901486-07.bin', $E000); // E000-FFFF
+  // VC20.SetSysFreq(fkPAL);
+
+
   VC20.LoadROM(fp+'..\ROMs\basic.901486-01.bin', $C000); // C000-DFFF
   VC20.LoadROM(fp+'..\ROMs\characters.901460-03.bin', $8000); // 8000-8FFF
   VC20.Exec;
